@@ -18,6 +18,11 @@
 
 #define __ECONETGPIOKERNEL_H__
 
+/* Updated busy wait on read SR to see if we can get rid of the misreads */
+/* Comment out for old version of code */
+
+// #define ECONET_GPIO_FASTWAIT
+
 /* 
  * Max packet buffers for module-fast - maximum 32
  */

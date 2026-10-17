@@ -19,6 +19,10 @@
 
 #include "../include/econet-gpio.h"
 
+#ifdef ECONET_GPIO_NEW
+#undef ECONET_GPIO_FASTWAIT
+#endif
+
 /* Variables primarily used here */
 
 /* Variables to hold the two main status registers */
@@ -74,6 +78,33 @@ void econet_set_dir(short d)
 
 	barrier();
 
+}
+
+/* 
+ * econet_wait_not_busy_with_data()
+ *
+ * Wait for not busy, but read the data at the same
+ * time for speed
+ */
+
+uint8_t inline econet_wait_not_busy_with_data(void)
+{
+	uint32_t data;
+
+	do {
+		unsigned int _n = ECONET_ISBUSY_MAX_SPINS;
+
+		while (
+			((data = ioread32(NGPLEV0)) & (1 << ECONET_GPIO_PIN_BUSY))
+			&& --_n
+		      )
+			cpu_relax();
+
+		if (!_n)
+			printk_ratelimited(KERN_WARNING "econet-fast: BUSY pin stuck at %s:%d - giving up wait\n", __FILE__, __LINE__); 
+	} while (0);
+
+	return ((data & ECONET_GPIO_CLRMASK_DATA) >> ECONET_GPIO_PIN_DATA);
 }
 
 /* 
@@ -288,15 +319,24 @@ inline unsigned char econet_read_sr(unsigned short r)
 
 	econet_set_cs(ECONET_GPIO_CS_OFF);	
 
-#ifndef ECONET_GPIO_NEW
+//#ifndef ECONET_GPIO_NEW
 	if (econet_data->hwver < 2)
 	{
 		ndelay(100);
+		d = (ioread32(NGPLEV0) & ECONET_GPIO_CLRMASK_DATA) >> ECONET_GPIO_PIN_DATA;
 	}
 	else
-#endif
+	{
+//#endif
+#ifdef ECONET_GPIO_FASTWAIT
+		d = econet_wait_not_busy_with_data();
+#else
 		econet_wait_not_busy();
+		d = (ioread32(NGPLEV0) & ECONET_GPIO_CLRMASK_DATA) >> ECONET_GPIO_PIN_DATA;
+#endif
+	}
 
+/* This historically doesn't work - just comment out 
 #ifdef ECONET_GPIO_NEW
 
 	if (gpiod_get_array_value(8, data_desc_array, NULL, &gpioval_array) < 0)
@@ -310,8 +350,9 @@ inline unsigned char econet_read_sr(unsigned short r)
 	}
 
 #else
-	d = (ioread32(NGPLEV0) & ECONET_GPIO_CLRMASK_DATA) >> ECONET_GPIO_PIN_DATA;
-#endif
+	*/
+	//d = (ioread32(NGPLEV0) & ECONET_GPIO_CLRMASK_DATA) >> ECONET_GPIO_PIN_DATA;
+/* #endif */
 
 	return d;	
 }
