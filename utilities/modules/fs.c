@@ -4243,14 +4243,22 @@ void fsop_reply_ok(struct fsop_data * f)
 
 void fsop_reply_success(struct fsop_data *f, uint8_t cmd, uint8_t code)
 {
-	FS_REPLY_DATA(0x80);
+	//FS_REPLY_DATA(0x80);
+	
+	struct __econet_packet_udp *reply;
 
-        reply.p.port = FSOP_REPLY_PORT;
-        reply.p.seq = eb_get_local_seq(f->server->fs_device);
-	reply.p.data[0] = cmd;
-	reply.p.data[1] = code;
+	reply = eb_malloc(__FILE__, __LINE__, "FS", "Success reply packet", 10);
 
-        fsop_aun_send (&reply, 2, f);
+	reply->p.ctrl = 0x80;
+	reply->p.ptype = ECONET_AUN_DATA;
+        reply->p.port = FSOP_REPLY_PORT;
+        reply->p.seq = eb_get_local_seq(f->server->fs_device);
+	reply->p.data[0] = cmd;
+	reply->p.data[1] = code;
+
+        fsop_aun_send (reply, 2, f);
+
+	eb_free(__FILE__, __LINE__, "FS", "Free success packet", reply);
 }
 
 /*
@@ -4369,6 +4377,14 @@ void fsop_bye_internal(struct __fs_active *a, uint8_t do_reply, uint8_t reply_po
 		struct __fs_active_load_queue *n;
 
 		n = alq->next;
+
+		/* A load queue for a *LOAD only uses an
+		 * internal handle, so the cleanup below does
+		 * not close it. Close it here instead.
+		 */
+
+		if (alq->queue_type == FS_ENQUEUE_LOAD)
+			fsop_close_interlock(a->server, alq->internal_handle, alq->mode);
 
 		FS_LIST_SPLICEFREE(a->load_queue,alq,"FS","Free load queue entry on *BYE");
 
@@ -6124,7 +6140,9 @@ void * FS_module_thread (void *p)
 	
 	pthread_mutex_unlock(&(me->module_mutex)); 
 	
-	pthread_exit(NULL); 
+	//pthread_exit(NULL); 
+	
+	return NULL;
 }
 
 /*
