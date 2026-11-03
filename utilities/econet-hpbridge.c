@@ -2430,11 +2430,140 @@ static void * eb_wire_requery (void *device)
 	}
 
 	pthread_mutex_lock (&networks_update);
-	memset (me->wire.relearn, 0, sizeof(me->wire.relearn));
+
+	if (tries >= EB_REQUERY_TRIES) /* Gave up: forget what is still missing */
+		memset (me->wire.relearn, 0, sizeof(me->wire.relearn));
+	else
+	{
+		/* A reset may have marked nets again after the last check; if so, go round again */
+
+		for (uint16_t n = 1; n < 255; n++)
+			if (me->wire.relearn[n] && networks[n] != me)
+			{
+				pthread_mutex_unlock (&networks_update);
+				eb_debug (0, 2, "BRIDGE", "Wire     %3d     Re-query: nets marked again by a later reset - checking again", me->net);
+				return eb_wire_requery (device);
+			}
+	}
+
 	me->wire.requery_running = 0;
 	pthread_mutex_unlock (&networks_update);
 
 	return NULL;
+}
+
+/*
+ * eb_wire_requery_mark() - mark-usher fork. Caller holds networks_update and calls this just
+ * before networks[] is put back to networks_initial[]. Notes, per wire, the nets learnt from a
+ * bridge on that wire, unless the reset came from that wire (its bridges announce anyway).
+ * Used by both reset paths: eb_bridge_reset() (internal resets) and the BridgeReset received
+ * from a trunk or wire (eb_reset_tables() in eb_broadcast_handler()).
+ */
+
+static void eb_wire_requery_mark (struct __eb_device *trigger)
+{
+	struct __eb_device	*dev;
+
+	for (dev = devices; dev; dev = dev->next)
+	{
+		char		list[256*4+1];
+		uint8_t		count = 0;
+
+		if (dev->type != EB_DEF_WIRE || dev == trigger)
+			continue;
+
+		list[0] = '\0';
+
+		for (uint16_t n = 1; n < 255; n++)
+			if (networks[n] == dev && !networks_initial[n] && dev->net != n)
+			{
+				char	s[6];
+
+				dev->wire.relearn[n] = 1;
+				snprintf (s, sizeof(s), " %d", n);
+				strcat (list, s);
+				count++;
+			}
+
+		if (count)
+			eb_debug (0, 2, "BRIDGE", "Wire     %3d     Re-query armed: nets%s were learnt on this wire before the reset", dev->net, list);
+	}
+}
+
+/*
+ * eb_wire_requery_start() - mark-usher fork. Starts eb_wire_requery() on each wire with nets
+ * marked by eb_wire_requery_mark() and no re-query already running. Call after the reset.
+ */
+
+static void eb_wire_requery_start (void)
+{
+	struct __eb_device	*dev;
+
+	pthread_mutex_lock (&networks_update);
+
+	for (dev = devices; dev; dev = dev->next)
+	{
+		uint8_t		any = 0;
+
+		if (dev->type != EB_DEF_WIRE || dev->wire.requery_running)
+			continue;
+
+		for (uint16_t n = 1; n < 255; n++)
+			if (dev->wire.relearn[n]) any = 1;
+
+		if (any)
+		{
+			pthread_t	rq;
+
+			dev->wire.requery_running = 1;
+
+			if (pthread_create (&rq, NULL, eb_wire_requery, dev) == 0)
+				pthread_detach (rq);
+			else
+			{
+				dev->wire.requery_running = 0;
+				eb_debug (0, 1, "BRIDGE", "Wire     %3d     Re-query: could not start thread", dev->net);
+			}
+		}
+	}
+
+	pthread_mutex_unlock (&networks_update);
+}
+
+/*
+ * eb_log_wire_bridge_frame() - mark-usher fork (F-35 diagnostics). Logs, at level 2, one
+ * bridge-protocol frame (port &9C) heard on or sent to a wire, with its addresses and data,
+ * so that the log shows whether a BridgeReset reached the wire and whether a reply came back.
+ */
+
+static void eb_log_wire_bridge_frame (struct __eb_device *d, char *what, struct __econet_packet_aun *p, int datalen, char *extra)
+{
+	char		data[32*3+8];
+	char		*name;
+
+	switch (p->p.ctrl)
+	{
+		case BRIDGE_RESET:	name = "reset"; break;
+		case BRIDGE_UPDATE:	name = "update"; break;
+		case BRIDGE_WHATNET:	name = "WhatNet"; break;
+		case BRIDGE_ISNET:	name = "IsNet"; break;
+		default:		name = "frame"; break;
+	}
+
+	data[0] = '\0';
+
+	for (int i = 0; i < datalen && i < 32; i++)
+	{
+		char	s[4];
+
+		snprintf (s, sizeof(s), " %02X", p->p.data[i]);
+		strcat (data, s);
+	}
+
+	if (datalen > 32)
+		strcat (data, " ...");
+
+	eb_debug (0, 2, "BRIDGE", "Wire     %3d     %s bridge %s ctrl &%02X %3d.%3d -> %3d.%3d len %d data%s%s", d->net, what, name, p->p.ctrl, p->p.srcnet, p->p.srcstn, p->p.dstnet, p->p.dststn, datalen, (datalen ? data : " none"), extra);
 }
 
 /*
@@ -2475,9 +2604,7 @@ void eb_bridge_reset (struct __eb_device *trigger)
 	 * can ask that wire again if they are not announced after the reset
 	 */
 
-	for (uint16_t n = 1; n < 255; n++)
-		if (networks[n] && !networks_initial[n] && networks[n]->type == EB_DEF_WIRE && networks[n] != trigger && networks[n]->net != n)
-			networks[n]->wire.relearn[n] = 1;
+	eb_wire_requery_mark (trigger);
 
 	for (uint8_t n = 1; n < 255; n++) // Reset temporarily active exposures to inactive
 		if (networks[n])
@@ -2583,38 +2710,10 @@ void eb_bridge_reset (struct __eb_device *trigger)
 
 	/* mark-usher fork: start a re-query on each wire that had learnt nets (eb_wire_requery) */
 
-	pthread_mutex_lock (&networks_update);
-
-	for (dev = devices; dev; dev = dev->next)
-	{
-		uint8_t		any = 0;
-
-		if (dev->type != EB_DEF_WIRE || dev->wire.requery_running)
-			continue;
-
-		for (uint16_t n = 1; n < 255; n++)
-			if (dev->wire.relearn[n]) any = 1;
-
-		if (any)
-		{
-			pthread_t	rq;
-
-			dev->wire.requery_running = 1;
-
-			if (pthread_create (&rq, NULL, eb_wire_requery, dev) == 0)
-				pthread_detach (rq);
-			else
-			{
-				dev->wire.requery_running = 0;
-				eb_debug (0, 1, "BRIDGE", "Wire     %3d     Re-query: could not start thread", dev->net);
-			}
-		}
-	}
-
-	pthread_mutex_unlock (&networks_update);
+	eb_wire_requery_start ();
 }
 
-/* 
+/*
  * Respond to a station's WhatNet or IsNet query. Do so with
  * full packet from <farside>.0.
  */
@@ -3169,8 +3268,26 @@ void eb_broadcast_handler (struct __eb_device *source, struct __econet_packet_au
 				!(source->all_nets_pooled) // Don't reset if all nets on this device are pooled - no point
 			   ||	EB_CONFIG_POOL_RESET_FWD 	// Unless we want to
 			   )
-			) 
-				eb_reset_tables(); // Reset if need be. 
+			)
+			{
+				/* mark-usher fork: this path, not eb_bridge_reset(), handles a BridgeReset
+				 * received from a trunk or wire (e.g. relayed from the TNMoC cloud), so arm
+				 * the wire re-query here too (eb_wire_requery)
+				 */
+
+				if (source->type == EB_DEF_WIRE)
+					eb_debug (0, 2, "BRIDGE", "Wire     %3d     Networks list reset by bridge reset from %3d.%3d", source->net, p->p.srcnet, p->p.srcstn);
+				else
+					eb_debug (0, 2, "BRIDGE", "Trunk    %7d Networks list reset by bridge reset from %s:%d", source->trunk.local_port, source->trunk.hostname ? source->trunk.hostname : "(Not connected)", source->trunk.hostname ? source->trunk.remote_port : 0);
+
+				pthread_mutex_lock (&networks_update);
+				eb_wire_requery_mark (source);
+				pthread_mutex_unlock (&networks_update);
+
+				eb_reset_tables(); // Reset if need be.
+
+				eb_wire_requery_start ();
+			}
 
 			// Go through the data and update our networks table
 
@@ -7226,6 +7343,11 @@ static void * eb_device_despatcher (void * device)
 
 				}
 
+				/* mark-usher fork (F-35): log every bridge-protocol frame heard on a wire */
+
+				if (d->type == EB_DEF_WIRE && length >= 12 && packet.p.port == BRIDGE_PORT && packet.p.ctrl >= BRIDGE_RESET && packet.p.ctrl <= BRIDGE_ISNET)
+					eb_log_wire_bridge_frame (d, "RX", &packet, length - 12, packetreceived ? "" : " - DROPPED: device not usable");
+
 				if (packetreceived && (length >= 12))
 				{
 					eb_add_stats (&(d->statsmutex), &(d->b_out), length-12); // Interface producing outbound traffic
@@ -7489,6 +7611,11 @@ static void * eb_device_despatcher (void * device)
 				/* 20250713 Next line moved to here from just before the if (!dump_traffic && d->type != EB_DEF_TRUNK) above */
 
 				if (!dump_traffic) eb_dump_packet (d, EB_PKT_DUMP_PRE_I, &packet, length - 12);
+
+				/* mark-usher fork (F-35): say when a wire bridge frame is thrown away here */
+
+				if (dump_traffic && d->type == EB_DEF_WIRE && packet.p.port == BRIDGE_PORT && packet.p.ctrl >= BRIDGE_RESET && packet.p.ctrl <= BRIDGE_ISNET)
+					eb_log_wire_bridge_frame (d, "RX", &packet, length - 12, d->loop_blocked ? " - DROPPED: wire loop-blocked" : " - DROPPED: inbound firewall");
 
 				// Apply pool nat to wire & trunk devices
 
@@ -8225,6 +8352,14 @@ static void * eb_device_despatcher (void * device)
 								{
 									remove = 1; // These are hard fails
 									eb_debug (0, 4, "DESPATCH", "%-8s %3d     Attempt to transmit packet to %d.%d from %d.%d at %p FAILED (Terminal) with error 0x%02X (%s) (written: %d/%d)- attempt %d", eb_type_str(d->type), d->net, tx.p.dstnet, tx.p.dststn, tx.p.srcnet, tx.p.srcstn, p, err, econet_strtxerr(err), result, p->length + 12, p->tx);
+
+									if (tx.p.port == BRIDGE_PORT && tx.p.ctrl >= BRIDGE_RESET && tx.p.ctrl <= BRIDGE_ISNET) /* mark-usher fork (F-35) */
+									{
+										char	extra[96];
+
+										snprintf (extra, sizeof(extra), " - attempt %d: FAILED (terminal) %s (0x%02X) - dropped", p->tx, econet_strtxerr(err), err);
+										eb_log_wire_bridge_frame (d, "TX", &tx, p->length, extra);
+									}
 								}
 								else if (result == p->length + 12) // Only if we wrote it all correctly!
 								{
@@ -8246,6 +8381,16 @@ static void * eb_device_despatcher (void * device)
 									}
 		
 									eb_debug (0, 4, "DESPATCH", "%-8s %3d     while() loop ended for packet at pq %p, packet at %p after %d ms (result = %02X)", eb_type_str(d->type), d->net, p, p->p, /*timediffmsec(&start, &now)*/ timediffnow(&start), err);
+
+									/* mark-usher fork (F-35): did the bridge frame get onto the wire? */
+
+									if (tx.p.port == BRIDGE_PORT && tx.p.ctrl >= BRIDGE_RESET && tx.p.ctrl <= BRIDGE_ISNET)
+									{
+										char	extra[96];
+
+										snprintf (extra, sizeof(extra), " - attempt %d: %s (0x%02X) after %lu ms", p->tx, (err == ECONET_TX_SUCCESS ? "sent" : econet_strtxerr(err)), err, timediffnow(&start));
+										eb_log_wire_bridge_frame (d, "TX", &tx, p->length, extra);
+									}
 
 									if (err == ECONET_TX_SUCCESS)
 									{
@@ -8367,7 +8512,16 @@ static void * eb_device_despatcher (void * device)
 									aunstate = ioctl(d->wire.socket, ECONETGPIO_IOC_GETAUNSTATE);
 
 									eb_debug (0, 4, "DESPATCH", "%-8s %3d     Attempt to transmit packet to %d.%d from %d.%d at %p FAILED with error 0x%02X (%s) - attempt %d - kernel tx ptr = 0x%02X, aun_state = 0x%02X", eb_type_str(d->type), d->net, tx.p.dstnet, tx.p.dststn, tx.p.srcnet, tx.p.srcstn, p, err, econet_strtxerr(err), p->tx, (aunstate >> 16), aunstate & 0xff);
-									p->errors++;	
+
+									if (tx.p.port == BRIDGE_PORT && tx.p.ctrl >= BRIDGE_RESET && tx.p.ctrl <= BRIDGE_ISNET) /* mark-usher fork (F-35) */
+									{
+										char	extra[96];
+
+										snprintf (extra, sizeof(extra), " - attempt %d: FAILED (written %d/%d) %s (0x%02X)", p->tx, result, p->length + 12, econet_strtxerr(err), err);
+										eb_log_wire_bridge_frame (d, "TX", &tx, p->length, extra);
+									}
+
+									p->errors++;
 									wire_output_pending++;
 
 									/* TODO */ if (p->errors > 3 && (err == ECONET_TX_NECOUTEZPAS))
@@ -8379,6 +8533,10 @@ static void * eb_device_despatcher (void * device)
 							else
 							{
 								remove = 1; // Dump it - too many retries
+
+								if (tx.p.port == BRIDGE_PORT && tx.p.ctrl >= BRIDGE_RESET && tx.p.ctrl <= BRIDGE_ISNET) /* mark-usher fork (F-35) */
+									eb_log_wire_bridge_frame (d, "TX", &tx, p->length, " - GIVEN UP after the retry limit - dropped");
+
 								ack.p.aun_ttype = ECONET_AUN_NAK;
 								if (tx.p.aun_ttype == ECONET_AUN_DATA)
 								{
