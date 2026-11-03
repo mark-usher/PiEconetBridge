@@ -177,7 +177,12 @@ void fsop_12_internal (struct fsop_data *f, uint8_t is_32bit)
 
                 if (p.ftype != FS_FTYPE_DIR)
                 {
-                        fsop_error(f, 0xAF, "Types don't match");
+                        /* Acorn's Level 3 / FileStore servers (CPINFO arg 6, via DIRIN2 "force directory")
+                         * answer a file here with &D6 "Not found", as for a missing name: clients use arg 6 to
+                         * ask "is this a directory?". &AF made Acorn's DOS client (EcoLink REDIR) fail every
+                         * COPY with "NET808: Incorrect response from network".
+                         */
+                        fsop_error(f, 0xD6, "Not found");
                         return;
                 }
 
