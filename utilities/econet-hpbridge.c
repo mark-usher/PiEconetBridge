@@ -2329,7 +2329,115 @@ void eb_bridge_update (struct __eb_device *trigger, uint8_t ctrl)
 
 }
 
-/* 
+/*
+ * eb_wire_requery() - mark-usher fork, 3 Nov 2026
+ *
+ * After a bridge reset, ask the bridges on one wire again for their nets if some that were
+ * learnt on that wire before the reset have not been announced again. The bridge protocol has
+ * one way to make a bridge announce: a BridgeReset (port &9C, ctrl &80). An SJ Research Bridge
+ * 3.04 (and the Acorn Bridge) answers it with a burst of BridgeReplies (ctrl &81) back onto the
+ * side it heard it on, and those are learnt by the normal update path. Nothing is added to
+ * networks[] by this routine.
+ *
+ * Why: a reset relayed from the TNMoC cloud at 18:28 on 3 Nov 2026 wiped net 4 (the FileStore
+ * 4.254 behind an SJ Bridge on pad-pieb's wire) and no reply came, so net 4 stayed unreachable
+ * until a restart.
+ *
+ * Runs as a detached thread, one per wire at a time (wire.requery_running): waits
+ * EB_REQUERY_WAIT seconds, then up to EB_REQUERY_TRIES times sends one BridgeReset on this wire
+ * only while any of wire.relearn[] has not come back, waiting EB_REQUERY_WAIT seconds each time.
+ */
+
+#define EB_REQUERY_WAIT		5
+#define EB_REQUERY_TRIES	3
+
+static void * eb_wire_requery (void *device)
+{
+	struct __eb_device		*me = (struct __eb_device *) device;
+	struct __econet_packet_aun	*update;
+	uint8_t				tries, missing, sender_net;
+	char				mlist[256*4+1];
+
+	for (tries = 0; tries <= EB_REQUERY_TRIES; tries++)
+	{
+		sleep (EB_REQUERY_WAIT);
+
+		missing = 0;
+		mlist[0] = '\0';
+
+		pthread_mutex_lock (&networks_update);
+
+		for (uint16_t n = 1; n < 255; n++)
+			if (me->wire.relearn[n])
+			{
+				if (networks[n] == me)
+					me->wire.relearn[n] = 0; /* Announced again */
+				else
+				{
+					char	s[6];
+
+					missing++;
+					snprintf (s, sizeof(s), " %d", n);
+					strcat (mlist, s);
+				}
+			}
+
+		pthread_mutex_unlock (&networks_update);
+
+		if (!missing)
+		{
+			if (tries)
+				eb_debug (0, 2, "BRIDGE", "Wire     %3d     Re-query: every net learnt here before the reset is announced again", me->net);
+			break;
+		}
+
+		if (tries == EB_REQUERY_TRIES)
+		{
+			eb_debug (0, 1, "BRIDGE", "Wire     %3d     Re-query: nets%s still not announced again after %d BridgeResets on this wire - giving up", me->net, mlist, EB_REQUERY_TRIES);
+			break;
+		}
+
+		sender_net = eb_bridge_sender_net(me);
+
+		if (!sender_net)
+		{
+			eb_debug (0, 2, "BRIDGE", "Wire     %3d     Re-query: no sender net - not sending", me->net);
+			continue;
+		}
+
+		update = eb_malloc (__FILE__, __LINE__, "BRIDGE", "Creating bridge re-query reset", sizeof(struct __econet_packet_aun));
+
+		if (!update)
+		{
+			eb_debug (0, 1, "BRIDGE", "Wire     %3d     Re-query: malloc() failed", me->net);
+			break;
+		}
+
+		update->p.aun_ttype = ECONET_AUN_BCAST;
+		update->p.port = BRIDGE_PORT;
+		update->p.ctrl = BRIDGE_RESET;
+		update->p.seq = (bridgewide_seq += 4);
+		update->p.srcstn = 0;
+		update->p.srcnet = sender_net;
+		update->p.dstnet = 0xff;
+		update->p.dststn = 0xff;
+		update->p.data[0] = sender_net;
+
+		eb_enqueue_input (me, update, 1);
+		pthread_cond_signal (&(me->qwake));
+
+		eb_debug (0, 2, "BRIDGE", "Wire     %3d     Re-query #%d: nets%s learnt here before the reset not announced again - sent BridgeReset on this wire only", me->net, tries + 1, mlist);
+	}
+
+	pthread_mutex_lock (&networks_update);
+	memset (me->wire.relearn, 0, sizeof(me->wire.relearn));
+	me->wire.requery_running = 0;
+	pthread_mutex_unlock (&networks_update);
+
+	return NULL;
+}
+
+/*
  * eb_bridge_reset()
  *
  * Bridge reset routine
@@ -2362,12 +2470,21 @@ void eb_bridge_reset (struct __eb_device *trigger)
 
 	pthread_mutex_lock (&networks_update);
 
+	/* mark-usher fork: note the nets learnt from a bridge on one of our wires (unless this
+	 * reset came from that wire, whose bridges will announce anyway), so that eb_wire_requery()
+	 * can ask that wire again if they are not announced after the reset
+	 */
+
+	for (uint16_t n = 1; n < 255; n++)
+		if (networks[n] && !networks_initial[n] && networks[n]->type == EB_DEF_WIRE && networks[n] != trigger && networks[n]->net != n)
+			networks[n]->wire.relearn[n] = 1;
+
 	for (uint8_t n = 1; n < 255; n++) // Reset temporarily active exposures to inactive
 		if (networks[n])
 			eb_set_exposures_inactive(n);
 
 	memcpy (&networks, &networks_initial, sizeof(networks));
-	
+
 	/* Find active pipe devices
 	 * so that we can re-activate them after we re-set the
 	 * station map to the startup value, below
@@ -2463,6 +2580,38 @@ void eb_bridge_reset (struct __eb_device *trigger)
 	last_root_id_seen = 0xFFFFFFFF; /* Detected by the loop detector as meaning it needs to listen again */
 	when_root_id_seen = 0; /* Make sure the data is invalid */
 	pthread_mutex_unlock(&(loopdetect_mutex));
+
+	/* mark-usher fork: start a re-query on each wire that had learnt nets (eb_wire_requery) */
+
+	pthread_mutex_lock (&networks_update);
+
+	for (dev = devices; dev; dev = dev->next)
+	{
+		uint8_t		any = 0;
+
+		if (dev->type != EB_DEF_WIRE || dev->wire.requery_running)
+			continue;
+
+		for (uint16_t n = 1; n < 255; n++)
+			if (dev->wire.relearn[n]) any = 1;
+
+		if (any)
+		{
+			pthread_t	rq;
+
+			dev->wire.requery_running = 1;
+
+			if (pthread_create (&rq, NULL, eb_wire_requery, dev) == 0)
+				pthread_detach (rq);
+			else
+			{
+				dev->wire.requery_running = 0;
+				eb_debug (0, 1, "BRIDGE", "Wire     %3d     Re-query: could not start thread", dev->net);
+			}
+		}
+	}
+
+	pthread_mutex_unlock (&networks_update);
 }
 
 /* 
