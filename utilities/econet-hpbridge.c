@@ -439,6 +439,37 @@ void eb_debug (uint8_t quit, uint8_t level, char *module, char *fmt, ...)
 
 }
 
+/* Diagnostic replacement for pthread_mutex_lock() (see include/econet-hpbridge.h).
+ * Behaves exactly like pthread_mutex_lock() (waits forever) but logs every 15s while it is waiting,
+ * naming the call site, our tid and the tid of the thread that owns the mutex. If owner == us it is a
+ * self-deadlock (recursive lock on a non-recursive mutex).
+ * glibc-specific: reads __data.__owner.
+ */
+#undef pthread_mutex_lock
+int eb_mutex_lock_diag (pthread_mutex_t *m, const char *file, int line)
+{
+	int		r, waited = 0;
+	struct timespec	ts;
+
+	if ((r = pthread_mutex_trylock(m)) != EBUSY)
+		return r;
+
+	for (;;)
+	{
+		clock_gettime(CLOCK_REALTIME, &ts);
+		ts.tv_sec += 15;
+
+		if ((r = pthread_mutex_timedlock(m, &ts)) != ETIMEDOUT)
+			return r;
+
+		waited += 15;
+
+		eb_debug (0, 0, "LOCKSTALL", "tid %ld has waited %ds for mutex %p at %s:%d; owner tid %d%s",
+			(long) syscall(SYS_gettid), waited, (void *) m, file, line, (int) m->__data.__owner,
+			(m->__data.__owner == (int) syscall(SYS_gettid)) ? " (SELF-DEADLOCK)" : "");
+	}
+}
+
 /* Memory management debug
  * Both these *were* static inline, but changed to support FS
 */

@@ -1877,3 +1877,9 @@ extern fs_device	*fs_devices;
 #define fsd_malloc(d,s) eb_malloc(__FILE__, __LINE__, DRIVERNAME, d, s)
 #define fsd_free(d,p) eb_free(__FILE__, __LINE__, DRIVERNAME, d, p)
 
+/* Lock-stall diagnostics (hardening): every pthread_mutex_lock() in code which includes this header
+ * becomes a trylock followed by a 15s pthread_mutex_timedlock() loop which logs (never gives up, never
+ * changes behaviour) if a lock has been waited for that long. See eb_mutex_lock_diag() in econet-hpbridge.c
+ */
+int eb_mutex_lock_diag (pthread_mutex_t *, const char *, int);
+#define pthread_mutex_lock(m) eb_mutex_lock_diag((m), __FILE__, __LINE__)
