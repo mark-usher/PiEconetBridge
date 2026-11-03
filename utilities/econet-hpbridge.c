@@ -3506,7 +3506,20 @@ uint8_t eb_enqueue_output (struct __eb_device *source, struct __econet_packet_au
 			
 			if (!outq->destdevice) // Can't work out where we are going!
 			{
-				eb_debug (0, 2, "QUEUE", "%-8s %3d.%3d from %3d.%3d Seq 0x%08X Attempting to queue traffic when destination device cannot be found or is inactive dynamic AUN", eb_type_str(source->type), p->p.dstnet, p->p.dststn, p->p.srcnet, p->p.srcstn, p->p.seq);
+				{
+					/* Say what the unroutable packet was, not only where it was going (F-33, mark-usher fork):
+					 * the device it came in on, AUN type, port, ctrl, data length and its first 16 data bytes.
+					 * The text before " - via" is unchanged, so existing log searches still match.
+					 */
+					char		qdata[3 * 16 + 1];
+					uint16_t	qi, qn = (length < 16) ? length : 16;
+
+					qdata[0] = '\0';
+					for (qi = 0; qi < qn; qi++)
+						snprintf (&(qdata[qi * 3]), 4, "%02X ", p->p.data[qi]);
+
+					eb_debug (0, 2, "QUEUE", "%-8s %3d.%3d from %3d.%3d Seq 0x%08X Attempting to queue traffic when destination device cannot be found or is inactive dynamic AUN - via %s %d type 0x%02X port 0x%02X ctrl 0x%02X len %d data %s", eb_type_str(source->type), p->p.dstnet, p->p.dststn, p->p.srcnet, p->p.srcstn, p->p.seq, eb_type_str(source->type), (source->type == EB_DEF_TRUNK ? source->trunk.local_port : source->net), p->p.aun_ttype, p->p.port, p->p.ctrl, length, qdata);
+				}
 
 				/* Send INK/NAK back to source if it was an immediate or data packet and the host doesn't exist.
 				 *
