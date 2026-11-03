@@ -3152,7 +3152,7 @@ void eb_broadcast_handler (struct __eb_device *source, struct __econet_packet_au
 
 			if (
 				(loop_id == EB_CONFIG_TRUNK_LOOPDETECT_ID) 
-			&&	(hostdata = loopdetect_hostdata)
+			&&	(hostdata == loopdetect_hostdata)
 			)
 			{
 				char	interface_string[25];
@@ -3164,7 +3164,7 @@ void eb_broadcast_handler (struct __eb_device *source, struct __econet_packet_au
 				snprintf (interface_string, 24, "%s %d",
 						((source->type == EB_DEF_WIRE) ? "Wire" : "Trunk"),
 					 	((source->type == EB_DEF_WIRE) ? source->net : source->trunk.local_port));
-				eb_debug (0, 1, "BRIDGE", "%8s %3d.%3d Loop detected. Blocking interface %s", interface_string);
+				eb_debug (0, 1, "BRIDGE", "%-8s         Loop detected: probe root %08X host %08X came back. Blocking interface %s", "Core", loop_id, (uint32_t) hostdata, interface_string);
 			}
 			else
 			{
