@@ -3394,6 +3394,8 @@ uint8_t eb_enqueue_output (struct __eb_device *source, struct __econet_packet_au
 	struct __eb_packetqueue	*packetq;
 	struct __econet_packet_aun	*p;
 	uint8_t			result = 1;
+	struct __econet_packet_aun	unroutable_reply; /* Built under qmutex_out, sent after it is released */
+	uint8_t			send_unroutable_reply = 0;
 
 	/* 20250713 Fixup */
 
@@ -3506,27 +3508,28 @@ uint8_t eb_enqueue_output (struct __eb_device *source, struct __econet_packet_au
 			{
 				eb_debug (0, 2, "QUEUE", "%-8s %3d.%3d from %3d.%3d Seq 0x%08X Attempting to queue traffic when destination device cannot be found or is inactive dynamic AUN", eb_type_str(source->type), p->p.dstnet, p->p.dststn, p->p.srcnet, p->p.srcstn, p->p.seq);
 
-				/* Send INK back to source here if it was an immediate and the host doesn't exist */
-
-				/* Commented out - may well be causing problems  */
-				/* Uncommected 20250524 - we probably need to do this */
-				if ((source->type == EB_DEF_TRUNK || source->type == EB_DEF_POOL)) // An unroutable immediate - send an INK back to source
+				/* Send INK/NAK back to source if it was an immediate or data packet and the host doesn't exist.
+				 *
+				 * The reply is built here but sent only AFTER source->qmutex_out has been released: eb_enqueue_output()
+				 * takes source->qmutex_out itself, and it is a default (non-recursive) mutex, so calling it from here
+				 * would deadlock this thread on a lock it already holds.
+				 *
+				 * Only IMM and DATA get a reply. Replying to an ACK/NAK/INK/IMMREP/BCAST would be wrong, and could
+				 * ping-pong forever if the reply were itself unroutable.
+				 */
+				if ((source->type == EB_DEF_TRUNK || source->type == EB_DEF_POOL)
+				&&  ((p->p.aun_ttype == ECONET_AUN_IMM && p->p.port == 0x00) || p->p.aun_ttype == ECONET_AUN_DATA))
 				{
-					struct __econet_packet_aun ack;
+					memset (&unroutable_reply, 0, sizeof(unroutable_reply));
 
-					if (p->p.port == 0x00) /* Send INK */
-						ack.p.aun_ttype = ECONET_AUN_INK;
-					else if (p->p.aun_ttype == ECONET_AUN_DATA) /* Send NAK */
-						ack.p.aun_ttype = ECONET_AUN_NAK;
+					unroutable_reply.p.aun_ttype = (p->p.aun_ttype == ECONET_AUN_IMM) ? ECONET_AUN_INK : ECONET_AUN_NAK;
+					unroutable_reply.p.seq = p->p.seq;
+					unroutable_reply.p.dststn = p->p.srcstn;
+					unroutable_reply.p.dstnet = p->p.srcnet;
+					unroutable_reply.p.srcstn = p->p.dststn;
+					unroutable_reply.p.srcnet = p->p.dstnet;
 
-					ack.p.seq = p->p.seq;
-					ack.p.dststn = p->p.srcstn;
-					ack.p.dstnet = p->p.srcnet;
-					ack.p.srcstn = p->p.dststn;
-					ack.p.srcnet = p->p.dstnet;
-
-					if (p->p.port == 0x00 || p->p.aun_ttype == ECONET_AUN_DATA)
-						eb_enqueue_output(source, &ack, 0, NULL);
+					send_unroutable_reply = 1;
 				}
 
 				eb_free (__FILE__, __LINE__, "Q-OUT", "Free packet after dest device unknown", p);
@@ -3536,7 +3539,10 @@ uint8_t eb_enqueue_output (struct __eb_device *source, struct __econet_packet_au
 				eb_debug (0, 4, "QUEUE", "%-8s %3d     Output queue manager releasing mutex", eb_type_str(source->type), source->net);
 
 				pthread_mutex_unlock (&(source->qmutex_out));
-	
+
+				if (send_unroutable_reply)
+					eb_enqueue_output (source, &unroutable_reply, 0, NULL); /* Lock no longer held - safe */
+
 				return 0;
 			}
 
