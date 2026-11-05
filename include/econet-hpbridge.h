@@ -1333,6 +1333,10 @@ struct __eb_device { // Structure holding information about a "physical" device 
 			uint8_t		resilience; // 0 = off, 1 = on
 			uint8_t		twobytemode; // 0 = off, 1 = on
 			uint16_t	perceived_clock; // Perceived clock speed in kHz
+			struct timeval	busy_since; // mark-usher fork (wire-busy): first of the current run of transmit attempts the kernel module refused as busy
+			uint32_t	busy_count; // mark-usher fork (wire-busy): length of that run; 0 = last attempt was not refused as busy
+			uint32_t	busy_resets; // mark-usher fork (wire-busy): ADLC resets done by eb_wire_busy_watch()
+			uint8_t		busy_run_resets; // mark-usher fork (wire-busy): resets in the current run (0: next is read mode, else full reset)
 
 			// Pool nat config
 			uint8_t			use_pool[255];

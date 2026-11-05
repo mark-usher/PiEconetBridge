@@ -1821,6 +1821,88 @@ static void * eb_wire_immediate_reset (void * ebic)
 	free(values);
 
 	return NULL; // Die
+}
+
+/* mark-usher fork (wire-busy): reset an ADLC the kernel module keeps reporting as busy
+ *
+ * econet_writefd() in the econet-gpio module refuses a write with ECONET_TX_BUSY ("Flag busy because chip state not
+ * idle / flagfill") while its chip state machine is outside EM_IDLE / EM_IDLEINIT / EM_FLAGFILL. If an interrupt that
+ * should move it on never comes (no IRQ is pending, the line is quiet), it stays there: the module's own recoveries in
+ * econet_writefd() need tx_status >= ECONET_TX_DATAPROGRESS or a READ* AUN state, and the first BUSY answer sets
+ * tx_status to ECONET_TX_BUSY, so they never fire again. Nothing in the bridge resets the ADLC while the device stays
+ * open, so every packet for the wire is retried EB_CONFIG_WIRE_RETRIES times and NAKed, and nothing is received, until
+ * the bridge is restarted. Seen on pad-pieb, 5 Nov 2026 13:21:39 - 21:00+: 9119 such kernel lines, IRQ enabled and not
+ * asserted, 0 interrupts, every packet to net 1 / net 4 NAKed. At debug levels below 4 nothing of this was logged.
+ *
+ * Called for every transmit attempt on a wire with the kernel's tx status. When every attempt for at least
+ * EB_WIRE_BUSY_RESET_MS (and at least EB_WIRE_BUSY_RESET_MIN attempts) has been refused as busy and nothing has been
+ * received from the wire in that time, put the ADLC back to read mode (ECONETGPIO_IOC_READMODE, as at start-up). If
+ * that does not end the run, the next time do a full module reset (ECONETGPIO_IOC_RESET, which also clears the
+ * module's packet buffers and turns AUN mode off) and set the station map and read mode again, as at start-up.
+ * Logged at level 1 either way.
+ */
+
+#define EB_WIRE_BUSY_RESET_MS	3000
+#define EB_WIRE_BUSY_RESET_MIN	10
+
+static void eb_wire_busy_watch (struct __eb_device *d, int err)
+{
+	unsigned long	busy_ms, quiet_ms;
+	int		state;
+
+	if (err != ECONET_TX_BUSY) // The run of busy answers (if any) is over
+	{
+		d->wire.busy_count = 0;
+		d->wire.busy_run_resets = 0;
+		return;
+	}
+
+	if (d->wire.busy_count++ == 0)
+	{
+		eb_gettimeofday(&(d->wire.busy_since), 0);
+		return;
+	}
+
+	busy_ms = timediffnow(&(d->wire.busy_since));
+	quiet_ms = timediffnow(&(d->wire.last_rx));
+
+	if (d->wire.busy_count < EB_WIRE_BUSY_RESET_MIN || busy_ms < EB_WIRE_BUSY_RESET_MS || quiet_ms < EB_WIRE_BUSY_RESET_MS)
+		return;
+
+	state = ioctl(d->wire.socket, ECONETGPIO_IOC_GETAUNSTATE);
+
+	d->wire.busy_resets++;
+
+	if (d->wire.busy_run_resets++ == 0) // First reset in this run: read mode
+	{
+		eb_debug (0, 1, "DESPATCH", "%-8s %3d     Kernel module refused every transmit as busy for %lu ms (%u attempts, nothing received for %lu ms; tx ptr 0x%02X, chip state %d, AUN state 0x%02X) - resetting the ADLC to read mode (reset #%u)",
+			eb_type_str(d->type), d->net, busy_ms, d->wire.busy_count, quiet_ms, (state >> 16) & 0xffff, (state >> 8) & 0xff, state & 0xff, d->wire.busy_resets);
+		ioctl(d->wire.socket, ECONETGPIO_IOC_READMODE);
+	}
+	else // Read mode did not end it: full module reset, then station map and read mode as at start-up
+	{
+		eb_debug (0, 1, "DESPATCH", "%-8s %3d     Kernel module still refuses every transmit as busy after a read mode reset (%lu ms, %u attempts; tx ptr 0x%02X, chip state %d, AUN state 0x%02X) - full module reset (reset #%u)",
+			eb_type_str(d->type), d->net, busy_ms, d->wire.busy_count, (state >> 16) & 0xffff, (state >> 8) & 0xff, state & 0xff, d->wire.busy_resets);
+		ioctl(d->wire.socket, ECONETGPIO_IOC_RESET);
+		pthread_mutex_lock (&(d->wire.stations_lock));
+		ioctl(d->wire.socket, ECONETGPIO_IOC_SET_STATIONS, &(d->wire.stations));
+		pthread_mutex_unlock (&(d->wire.stations_lock));
+		ioctl(d->wire.socket, ECONETGPIO_IOC_READMODE);
+		ioctl(d->wire.socket, ECONETGPIO_IOC_EXTRALOGS, EB_CONFIG_EXTRALOGS);
+		if (d->wire.twobytemode)
+			ioctl(d->wire.socket, ECONETGPIO_IOC_TWOBYTEMODE, d->wire.twobytemode);
+	}
+
+	// Any immediate we were holding the line for is gone with the reset
+
+	pthread_mutex_lock (&(d->priority_mutex));
+	d->p_isresilience = d->p_net = d->p_stn = d->p_seq = 0;
+	pthread_mutex_unlock (&(d->priority_mutex));
+
+	// Start the clock again; if the next attempts are still refused, the run goes on and the next reset is a full one
+
+	eb_gettimeofday(&(d->wire.busy_since), 0);
+	d->wire.busy_count = 1;
 
 }
 
@@ -8052,6 +8134,8 @@ static void * eb_device_despatcher (void * device)
 								eb_add_stats (&(d->statsmutex), &(d->b_in), p->length);
 
 								err = ioctl(d->wire.socket, ECONETGPIO_IOC_TXERR);
+
+								eb_wire_busy_watch (d, err); // mark-usher fork (wire-busy): reset an ADLC stuck busy
 
 								if (err == ECONET_TX_NOCLOCK || err == ECONET_TX_NOCOPY /* || err == ECONET_TX_NECOUTEZPAS */) // Catches too many other errors || (result != p->length + 12))
 								{
